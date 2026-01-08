@@ -397,7 +397,7 @@ type Meta interface {
 	// CleanStaleSessions cleans up sessions not active for more than 5 minutes
 	CleanStaleSessions(ctx Context)
 	// CleanupTrashBefore deletes all files in trash before the given time.
-	CleanupTrashBefore(ctx Context, edge time.Time, increProgress func(int))
+	CleanupTrashBefore(ctx Context, edge time.Time, increProgress func(int), stats *CleanupTrashStats)
 	// CleanupDetachedNodesBefore deletes all detached nodes before the given time.
 	CleanupDetachedNodesBefore(ctx Context, edge time.Time, increProgress func())
 
@@ -499,7 +499,7 @@ type Meta interface {
 	// GetPaths returns all paths of an inode
 	GetPaths(ctx Context, inode Ino) []string
 	// Check integrity of an absolute path and repair it if asked
-	Check(ctx Context, fpath string, repair bool, recursive bool, statAll bool, showProgress func(n int), slices map[Ino][]Slice) error
+	Check(ctx Context, fpath string, opt *CheckOpt) error
 	// Change root to a directory specified by subdir
 	Chroot(ctx Context, subdir string) syscall.Errno
 	// chroot set the root directory by inode
@@ -530,6 +530,19 @@ type Meta interface {
 
 	SetFacl(ctx Context, ino Ino, aclType uint8, n *aclAPI.Rule) syscall.Errno
 	GetFacl(ctx Context, ino Ino, aclType uint8, n *aclAPI.Rule) syscall.Errno
+}
+
+type CheckOpt struct {
+	Repair        bool
+	Recursive     bool
+	SyncDirStat   bool
+	RepairDirMode uint16
+	ShowProgress  func(n int)
+	Slices        map[Ino][]Slice
+}
+
+type CleanupTrashStats struct {
+	DeletedFiles int64
 }
 
 type Creator func(driver, addr string, conf *Config) (Meta, error)

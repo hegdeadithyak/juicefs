@@ -92,7 +92,7 @@ type engine interface {
 	doDeleteSustainedInode(sid uint64, inode Ino) error
 	doFindDeletedFiles(ts int64, limit int) (map[Ino]uint64, error) // limit < 0 means all
 	doDeleteFileData(inode Ino, length uint64)
-	doCleanupSlices(ctx Context)
+	doCleanupSlices(ctx Context, stats *cleanupSlicesStats)
 	doCleanupDelayedSlices(ctx Context, edge int64) (int, error)
 	doDeleteSlice(id uint64, size uint32) error
 
@@ -115,7 +115,7 @@ type engine interface {
 	doLink(ctx Context, inode, parent Ino, name string, attr *Attr) syscall.Errno
 	doUnlink(ctx Context, parent Ino, name string, attr *Attr, skipCheckTrash ...bool) syscall.Errno
 	doRmdir(ctx Context, parent Ino, name string, inode *Ino, attr *Attr, skipCheckTrash ...bool) syscall.Errno
-	doBatchUnlink(ctx Context, parent Ino, entries []Entry, length *int64, space *int64, inodes *int64, userGroupQuotas *[]userGroupQuotaDelta, skipCheckTrash ...bool) (errno syscall.Errno)
+	doBatchUnlink(ctx Context, parent Ino, entries []*Entry, length *int64, space *int64, inodes *int64, userGroupQuotas *[]userGroupQuotaDelta, skipCheckTrash ...bool) (errno syscall.Errno)
 	doReadlink(ctx Context, inode Ino, noatime bool) (int64, []byte, error)
 	doReaddir(ctx Context, inode Ino, plus uint8, entries *[]*Entry, limit int) syscall.Errno
 	doRename(ctx Context, parentSrc Ino, nameSrc string, parentDst Ino, nameDst string, flags uint32, inode, tinode *Ino, attr, tattr *Attr) syscall.Errno
@@ -166,6 +166,10 @@ type fsStat struct {
 	newInodes  int64
 	usedSpace  int64
 	usedInodes int64
+}
+
+type cleanupSlicesStats struct {
+	deleted int64
 }
 
 // chunk for compaction
@@ -308,6 +312,9 @@ type baseMeta struct {
 	groupQuotaMaxInodesG  *prometheus.GaugeVec
 	groupQuotaUsedSpaceG  *prometheus.GaugeVec
 	groupQuotaUsedInodesG *prometheus.GaugeVec
+
+	bgjobDels     *prometheus.CounterVec
+	bgjobDuration *prometheus.HistogramVec
 
 	en engine
 }
@@ -462,6 +469,22 @@ func newBaseMeta(addr string, conf *Config) *baseMeta {
 			[]string{"gid"},
 		),
 
+		bgjobDuration: prometheus.NewHistogramVec(
+			prometheus.HistogramOpts{
+				Name:    "juicefs_bgjob_duration_seconds",
+				Help:    "Background job duration in seconds.",
+				Buckets: prometheus.ExponentialBuckets(1, 2, 13),
+			},
+			[]string{"job", "status"},
+		),
+		bgjobDels: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "juicefs_bgjob_deletions_total",
+				Help: "Number of deletions (files or slices) by background jobs.",
+			},
+			[]string{"job"},
+		),
+
 		dirQuotaMetricKeys:   make(map[uint64]bool),
 		userQuotaMetricKeys:  make(map[uint64]bool),
 		groupQuotaMetricKeys: make(map[uint64]bool),
@@ -490,6 +513,8 @@ func (m *baseMeta) InitSharedMetrics(reg prometheus.Registerer) {
 	reg.MustRegister(m.groupQuotaMaxInodesG)
 	reg.MustRegister(m.groupQuotaUsedSpaceG)
 	reg.MustRegister(m.groupQuotaUsedInodesG)
+	reg.MustRegister(m.bgjobDuration)
+	reg.MustRegister(m.bgjobDels)
 
 	go func() {
 		for {
@@ -894,19 +919,28 @@ func (m *baseMeta) cleanupDeletedFiles(ctx Context) {
 		if ok, err := m.en.setIfSmall("lastCleanupFiles", time.Now().Unix(), int64(time.Hour.Seconds())*9/10); err != nil {
 			logger.Warnf("checking counter lastCleanupFiles: %s", err)
 		} else if ok {
+			job := "cleanupDeletedFiles"
+			jobStart := time.Now()
 			files, err := m.en.doFindDeletedFiles(time.Now().Add(-time.Hour).Unix(), 6e5)
 			if err != nil {
 				logger.Warnf("scan deleted files: %s", err)
+				m.bgjobDuration.WithLabelValues(job, "failed").Observe(time.Since(jobStart).Seconds())
 				continue
 			}
 			start := time.Now()
+			var processed int64
+			status := "succ"
 			for inode, length := range files {
 				logger.Debugf("cleanup chunks of inode %d with %d bytes", inode, length)
 				m.en.doDeleteFileData(inode, length)
+				processed++
 				if time.Since(start) > 50*time.Minute { // Yield my time slice to avoid conflicts with other clients
+					status = "timeout"
 					break
 				}
 			}
+			m.bgjobDuration.WithLabelValues(job, status).Observe(time.Since(jobStart).Seconds())
+			m.bgjobDels.WithLabelValues(job).Add(float64(processed))
 		}
 	}
 }
@@ -922,9 +956,14 @@ func (m *baseMeta) cleanupSlices(ctx Context) {
 		if ok, err := m.en.setIfSmall("nextCleanupSlices", time.Now().Unix(), int64(time.Hour.Seconds())*9/10); err != nil {
 			logger.Warnf("checking counter nextCleanupSlices: %s", err)
 		} else if ok {
+			job := "cleanupSlices"
+			jobStart := time.Now()
 			cCtx := WrapWithTimeout(ctx, time.Minute*50)
-			m.en.doCleanupSlices(cCtx)
+			stats := &cleanupSlicesStats{}
+			m.en.doCleanupSlices(cCtx, stats)
 			cCtx.Cancel()
+			m.bgjobDuration.WithLabelValues(job, "succ").Observe(time.Since(jobStart).Seconds())
+			m.bgjobDels.WithLabelValues(job).Add(float64(stats.deleted))
 		}
 	}
 }
@@ -1613,7 +1652,10 @@ func (m *baseMeta) Rmdir(ctx Context, parent Ino, name string, skipCheckTrash ..
 	return st
 }
 
-func (m *baseMeta) BatchUnlink(ctx Context, parent Ino, entries []Entry, count *uint64, skipCheckTrash bool) syscall.Errno {
+func (m *baseMeta) BatchUnlink(ctx Context, parent Ino, entries []*Entry, count *uint64, skipCheckTrash bool) syscall.Errno {
+	if len(entries) == 0 {
+		return 0
+	}
 	var length int64
 	var space int64
 	var inodes int64
@@ -2222,7 +2264,7 @@ func (m *baseMeta) walk(ctx Context, inode Ino, p string, attr *Attr, walkFn met
 	return 0
 }
 
-func (m *baseMeta) Check(ctx Context, fpath string, repair bool, recursive bool, statAll bool, showProgress func(n int), slices map[Ino][]Slice) error {
+func (m *baseMeta) Check(ctx Context, fpath string, opt *CheckOpt) error {
 	var attr Attr
 	var inode = RootInode
 	var parent = RootInode
@@ -2271,7 +2313,7 @@ func (m *baseMeta) Check(ctx Context, fpath string, repair bool, recursive bool,
 	go func() {
 		defer close(nodes)
 		var count int64
-		if recursive {
+		if opt.Recursive {
 			if st := m.walk(ctx, inode, fpath, &attr, func(ctx Context, inode Ino, path string, attr *Attr) {
 				nodes <- &node{inode, path, attr}
 				atomic.AddInt64(&count, 1)
@@ -2290,17 +2332,17 @@ func (m *baseMeta) Check(ctx Context, fpath string, repair bool, recursive bool,
 	if err != nil {
 		return errors.Wrap(err, "load meta format")
 	}
-	if statAll && !format.DirStats {
+	if opt.SyncDirStat && !format.DirStats {
 		logger.Warn("dir stats is disabled, flag '--sync-dir-stat' will be ignored")
 	}
 	var lock sync.Mutex
 	listSlices := func(inode Ino, path string) {
 		lock.Lock()
-		if _, ok := slices[inode]; ok {
+		if _, ok := opt.Slices[inode]; ok {
 			lock.Unlock()
 			return
 		}
-		slices[inode] = []Slice{}
+		opt.Slices[inode] = []Slice{}
 		lock.Unlock()
 		rawSlices, st := m.en.doList(ctx, inode)
 		if st != 0 {
@@ -2314,9 +2356,9 @@ func (m *baseMeta) Check(ctx Context, fpath string, repair bool, recursive bool,
 			}
 		}
 		lock.Lock()
-		slices[inode] = ss
-		if showProgress != nil {
-			showProgress(len(slices[inode]))
+		opt.Slices[inode] = ss
+		if opt.ShowProgress != nil {
+			opt.ShowProgress(len(opt.Slices[inode]))
 		}
 		lock.Unlock()
 	}
@@ -2358,10 +2400,10 @@ func (m *baseMeta) Check(ctx Context, fpath string, repair bool, recursive bool,
 				}
 
 				if attrBroken {
-					if repair {
+					if opt.Repair {
 						if !attr.Full {
 							now := time.Now().Unix()
-							attr.Mode = 0755
+							attr.Mode = opt.RepairDirMode
 							attr.Uid = ctx.Uid()
 							attr.Gid = ctx.Gid()
 							attr.Atime = now
@@ -2396,7 +2438,7 @@ func (m *baseMeta) Check(ctx Context, fpath string, repair bool, recursive bool,
 						statBroken = true
 					}
 
-					if !repair && statAll {
+					if !opt.Repair && opt.SyncDirStat {
 						s, st := m.calcDirStat(ctx, inode)
 						if st != 0 {
 							hasError = true
@@ -2409,8 +2451,8 @@ func (m *baseMeta) Check(ctx Context, fpath string, repair bool, recursive bool,
 						}
 					}
 
-					if repair {
-						if statBroken || statAll {
+					if opt.Repair {
+						if statBroken || opt.SyncDirStat {
 							if _, st := m.en.doSyncDirStat(ctx, inode); st == 0 || st == syscall.ENOENT {
 								logger.Debugf("Stat of path %s (inode %d) is successfully synced", path, inode)
 							} else {
@@ -2428,7 +2470,7 @@ func (m *baseMeta) Check(ctx Context, fpath string, repair bool, recursive bool,
 		}()
 	}
 	wg.Wait()
-	if fpath == "/" && repair && recursive && statAll {
+	if fpath == "/" && opt.Repair && opt.Recursive && opt.SyncDirStat {
 		if err := m.syncVolumeStat(ctx); err != nil {
 			logger.Errorf("Sync used space: %s", err)
 			hasError = true
@@ -2813,9 +2855,23 @@ func (m *baseMeta) cleanupTrash(ctx Context) {
 				cCtx.Cancel()
 			}
 			cCtx = WrapWithTimeout(ctx, 50*time.Minute)
+			job := "cleanupTrash"
+			jobStart := time.Now()
 			days := m.getFormat().TrashDays
-			go m.doCleanupTrash(cCtx, days, false)
-			go m.cleanupDelayedSlices(cCtx, days)
+			stats := &CleanupTrashStats{}
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				m.doCleanupTrash(cCtx, days, false, stats)
+			}()
+			go func() {
+				defer wg.Done()
+				m.cleanupDelayedSlices(cCtx, days)
+			}()
+			wg.Wait()
+			m.bgjobDuration.WithLabelValues(job, "succ").Observe(time.Since(jobStart).Seconds())
+			m.bgjobDels.WithLabelValues(job).Add(float64(atomic.LoadInt64(&stats.DeletedFiles)))
 		}
 	}
 }
@@ -2832,7 +2888,7 @@ func (m *baseMeta) CleanupDetachedNodesBefore(ctx Context, edge time.Time, incre
 	}
 }
 
-func (m *baseMeta) CleanupTrashBefore(ctx Context, edge time.Time, increProgress func(int)) {
+func (m *baseMeta) CleanupTrashBefore(ctx Context, edge time.Time, increProgress func(int), stats *CleanupTrashStats) {
 	logger.Debugf("cleanup trash: started")
 	now := time.Now()
 	var st syscall.Errno
@@ -2846,6 +2902,9 @@ func (m *baseMeta) CleanupTrashBefore(ctx Context, edge time.Time, increProgress
 	defer func() {
 		if count > 0 {
 			logger.Infof("cleanup trash: deleted %d files in %v", count, time.Since(now))
+			if stats != nil {
+				atomic.AddInt64(&stats.DeletedFiles, int64(count))
+			}
 		} else {
 			logger.Debugf("cleanup trash: nothing to delete")
 		}
@@ -2874,6 +2933,9 @@ func (m *baseMeta) CleanupTrashBefore(ctx Context, edge time.Time, increProgress
 				entries = entries[1:]
 			}
 			for _, se := range subEntries {
+				if ctx.Canceled() {
+					return
+				}
 				var c uint64
 				st = m.Remove(ctx, e.Inode, string(se.Name), false, m.conf.MaxDeletes, &c)
 				if st == 0 {
@@ -2882,12 +2944,10 @@ func (m *baseMeta) CleanupTrashBefore(ctx Context, edge time.Time, increProgress
 						increProgress(int(c))
 					}
 				} else {
-					logger.Warnf("delete from trash %s/%s: %s", e.Name, se.Name, st)
+					if st != syscall.ETIMEDOUT && st != syscall.EINTR {
+						logger.Warnf("delete from trash %s/%s: %s", e.Name, se.Name, st)
+					}
 					rmdir = false
-					continue
-				}
-				if ctx.Canceled() {
-					return
 				}
 			}
 			if rmdir {
@@ -2959,12 +3019,12 @@ func (m *baseMeta) scanTrashFiles(ctx Context, scan trashFileScan) error {
 	return nil
 }
 
-func (m *baseMeta) doCleanupTrash(ctx Context, days int, force bool) {
+func (m *baseMeta) doCleanupTrash(ctx Context, days int, force bool, stats *CleanupTrashStats) {
 	edge := time.Now().Add(-time.Duration(24*days+2) * time.Hour)
 	if force {
 		edge = time.Now()
 	}
-	m.CleanupTrashBefore(ctx, edge, nil)
+	m.CleanupTrashBefore(ctx, edge, nil, stats)
 }
 
 func (m *baseMeta) cleanupDelayedSlices(ctx Context, days int) {

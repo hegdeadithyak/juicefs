@@ -2258,7 +2258,7 @@ func testTrash(t *testing.T, m Meta) {
 	if st := m.Rename(ctx2, TrashInode+1, "d", 1, "f", 0, &inode, attr); st != syscall.EPERM {
 		t.Fatalf("rename d -> f: %s", st)
 	}
-	m.getBase().doCleanupTrash(Background(), format.TrashDays, true)
+	m.getBase().doCleanupTrash(Background(), format.TrashDays, true, nil)
 	if st := m.GetAttr(ctx2, TrashInode+1, attr); st != syscall.ENOENT {
 		t.Fatalf("getattr: %s", st)
 	}
@@ -2714,7 +2714,10 @@ func testCheckAndRepair(t *testing.T, m Meta) {
 
 	showProgress := func(n int) {}
 	slices := make(map[Ino][]Slice)
-	if err := m.Check(Background(), "/check", false, false, false, showProgress, slices); err == nil {
+	if err := m.Check(Background(), "/check", &CheckOpt{
+		ShowProgress: showProgress,
+		Slices:       slices,
+	}); err == nil {
 		t.Fatal("check should fail")
 	}
 	if st := m.GetAttr(Background(), checkInode, dirAttr); st != 0 {
@@ -2724,7 +2727,11 @@ func testCheckAndRepair(t *testing.T, m Meta) {
 		t.Fatalf("checkInode nlink should is 0 now: %d", dirAttr.Nlink)
 	}
 
-	if err := m.Check(Background(), "/check", true, false, false, showProgress, slices); err != nil {
+	if err := m.Check(Background(), "/check", &CheckOpt{
+		Repair:       true,
+		ShowProgress: showProgress,
+		Slices:       slices,
+	}); err != nil {
 		t.Fatalf("check: %s", err)
 	}
 	if st := m.GetAttr(Background(), checkInode, dirAttr); st != 0 {
@@ -2734,7 +2741,11 @@ func testCheckAndRepair(t *testing.T, m Meta) {
 		t.Fatalf("checkInode nlink should is 3 now: %d", dirAttr.Nlink)
 	}
 
-	if err := m.Check(Background(), "/check/d1/d2", true, false, false, showProgress, slices); err != nil {
+	if err := m.Check(Background(), "/check/d1/d2", &CheckOpt{
+		Repair:       true,
+		ShowProgress: showProgress,
+		Slices:       slices,
+	}); err != nil {
 		t.Fatalf("check: %s", err)
 	}
 	if st := m.GetAttr(Background(), d2Inode, dirAttr); st != 0 {
@@ -2751,7 +2762,12 @@ func testCheckAndRepair(t *testing.T, m Meta) {
 	}
 
 	if m.Name() != "etcd" {
-		if err := m.Check(Background(), "/", true, true, false, showProgress, slices); err != nil {
+		if err := m.Check(Background(), "/", &CheckOpt{
+			Repair:       true,
+			Recursive:    true,
+			ShowProgress: showProgress,
+			Slices:       slices,
+		}); err != nil {
 			t.Fatalf("check: %s", err)
 		}
 		for _, ino := range []Ino{checkInode, d1Inode, d2Inode, d3Inode} {
@@ -4735,13 +4751,13 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 		t.Fatalf("User group quota not found before batch unlink")
 	}
 
-	var entries []Entry
+	var entries []*Entry
 	for i, fileName := range fileNames {
 		var attr Attr
 		if st := m.GetAttr(ctx, fileInodes[i], &attr); st != 0 {
 			t.Fatalf("GetAttr for %s: %s", fileName, st)
 		}
-		entries = append(entries, Entry{
+		entries = append(entries, &Entry{
 			Inode: fileInodes[i],
 			Name:  []byte(fileName),
 			Attr:  &attr,
@@ -4835,7 +4851,7 @@ func testBatchUnlinkWithUserGroupQuota(t *testing.T, m Meta, ctx Context, parent
 	if st := m.GetAttr(ctx, hardlinkInode, &hardlinkEntry); st != 0 {
 		t.Fatalf("GetAttr for hardlink: %s", st)
 	}
-	hardlinkEntries := []Entry{
+	hardlinkEntries := []*Entry{
 		{
 			Inode: hardlinkInode,
 			Name:  []byte(hardlinkFileName2),

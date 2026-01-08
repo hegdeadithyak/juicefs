@@ -18,6 +18,7 @@ package meta
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"path"
@@ -136,6 +137,9 @@ func errno(err error) syscall.Errno {
 	}
 	if err == context.Canceled {
 		return syscall.EINTR
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return syscall.ETIMEDOUT
 	}
 	if eno, ok := err.(syscall.Errno); ok {
 		return eno
@@ -285,7 +289,8 @@ func updateLocks(ls []plockRecord, nl plockRecord) []plockRecord {
 func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *uint64, concurrent chan int) syscall.Errno {
 	for {
 		var entries []*Entry
-		if st := m.en.doReaddir(ctx, inode, 0, &entries, 10000); st != 0 && st != syscall.ENOENT {
+		// By operating in batches of 500, we can achieve the best performance experience.
+		if st := m.en.doReaddir(ctx, inode, 0, &entries, 500); st != 0 && st != syscall.ENOENT {
 			return st
 		}
 		if len(entries) == 0 {
@@ -296,7 +301,7 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 		}
 		var wg sync.WaitGroup
 		var status syscall.Errno
-		var nonDirEntries []Entry
+		var nonDirEntries []*Entry
 		for i, e := range entries {
 			if e.Attr.Typ == TypeDirectory {
 				select {
@@ -317,7 +322,7 @@ func (m *baseMeta) emptyDir(ctx Context, inode Ino, skipCheckTrash bool, count *
 					}
 				}
 			} else {
-				nonDirEntries = append(nonDirEntries, *e)
+				nonDirEntries = append(nonDirEntries, e)
 			}
 			if ctx.Canceled() {
 				return syscall.EINTR
